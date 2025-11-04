@@ -31,10 +31,12 @@ magic_headers.json
 
 1. 将以下文件放在同一目录：
 
+```
 detect_fake_zip.exe
 install.bat
 remove.bat
 magic_headers.json
+```
 
 2. 运行 `install.bat` 安装右键菜单。  
 3. 若要移除，运行 `remove.bat`。

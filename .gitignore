@@ -192,3 +192,6 @@ results/
 # 日志文件
 logs/
 *.log
+
+# 测试文件夹
+test/

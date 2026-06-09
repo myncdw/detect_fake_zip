@@ -6,13 +6,13 @@ from __future__ import annotations
 import json
 import ctypes
 import logging
+import mmap
 import os
 import subprocess
 import sys
 import threading
+import time
 import queue
-import re
-import shutil
 from pathlib import Path
 from tkinter import Tk, Label
 from typing import Dict, Tuple, Optional
@@ -21,26 +21,16 @@ from typing import Dict, Tuple, Optional
 #                                 常量 & 配置                                #
 # --------------------------------------------------------------------------- #
 
-# 获取当前执行文件所在目录（无论是 py 还是 exe）
 if getattr(sys, 'frozen', False):
-    # 打包后的情况
     SCRIPT_DIR = Path(sys.executable).resolve().parent
 else:
-    # 源码运行
     SCRIPT_DIR = Path(__file__).resolve().parent
 
-# 配置文件路径
 MAGIC_HEADERS_JSON = SCRIPT_DIR / "magic_headers.json"
-# 日志文件路径
-LOG_FILE = SCRIPT_DIR / "伪装分析.log"
-# 7-Zip 可执行文件路径
-PATH_7ZIP = SCRIPT_DIR / "7z\\7z.exe"
-# 全局递归次数上限
-TIMES = 5
-# 最终提取目录（没有移动前）
-TARGET_DIR = ""
-# 最初选择的文件的目录
-ROOT_DIR = None
+LOG_FILE           = SCRIPT_DIR / "analysis.log"
+
+
+
 
 # --------------------------------------------------------------------------- #
 #                                 日志配置                                   #
@@ -59,32 +49,25 @@ logging.basicConfig(
 #                                 工具函数                                   #
 # --------------------------------------------------------------------------- #
 
-
 def show_message(msg: str, title: str = "提示"):
-    # 跨平台弹窗提示（Windows 使用 MessageBox，其余输出控制台）。
     if sys.platform.startswith("win"):
         ctypes.windll.user32.MessageBoxW(0, msg, title, 0)
     else:
         print(f"{title}: {msg}")
 
+
 def load_magic_headers() -> Dict[bytes, str]:
-    # 读取压缩格式文件头 JSON
     try:
         with MAGIC_HEADERS_JSON.open("r", encoding="utf-8") as f:
             data = json.load(f)
-
-        compressed = {
+        return {
             bytes.fromhex(k.replace(" ", "")): v
             for k, v in data.get("compressed_formats", {}).items()
         }
-
-        return compressed
-
     except FileNotFoundError:
-        logging.error("%s 未找到，请确保配置文件存在。", MAGIC_HEADERS_JSON)
+        logging.error("%s 未找到", MAGIC_HEADERS_JSON)
         show_message(f"配置文件 {MAGIC_HEADERS_JSON.name} 未找到！", "错误")
         return {}
-
     except Exception as exc:
         logging.error("读取 %s 失败：%s", MAGIC_HEADERS_JSON, exc)
         show_message(f"读取配置文件失败：{exc}", "错误")
@@ -92,276 +75,147 @@ def load_magic_headers() -> Dict[bytes, str]:
 
 
 def find_compressed_start(
-    data: bytes, magic_headers: Dict[bytes, str]
+    file_path: Path, magic_headers: Dict[bytes, str]
 ) -> Tuple[int, Optional[str]]:
-    # 查找压缩包起始位置，返回 (偏移量, 格式)
+    with file_path.open("rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            ustar_idx = mm.find(b"ustar")
+            if ustar_idx != -1 and ustar_idx >= 257:
+                return ustar_idx - 257, "tar"
 
-    # 特殊处理 tar 格式
-    if len(data) >= 263 and data[257:263] == b"ustar":
-        return 0, "tar"
-    
-    # 查找其他压缩格式
-    for magic, fmt in magic_headers.items():
-        idx = data.find(magic)
-        if idx != -1:
-            return idx, fmt
-    
+            for magic, fmt in sorted(magic_headers.items(), key=lambda x: -len(x[0])):
+                if fmt == "tar":
+                    continue
+                idx = mm.find(magic)
+                if idx != -1:
+                    return idx, fmt
+
     return -1, None
 
 
-def safe_filename(base: str, suffix: str) -> str:
-    # 生成安全文件名
-    return f"{base}.{suffix}".replace(" ", "_").replace(":", "_")
+def extract_tail(file_path: Path, start_offset: int, fmt: str):
+    tail_file = file_path.parent / safe_filename(file_path.stem, fmt)
+    try:
+        with file_path.open("rb") as src, tail_file.open("wb") as dst:
+            src.seek(start_offset)
+            while True:
+                chunk = src.read(16 * 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        logging.info("[%s] 提取成功: %s (偏移: %d 字节)",
+                     file_path.name, fmt, start_offset)
+        open_file(tail_file)
+    except Exception as exc:
+        logging.error("保存/打开失败：%s", exc)
+
+
+def safe_filename(stem: str, fmt: str) -> str:
+    return f"{stem}_提取.{fmt}".replace(" ", "_").replace(":", "_")
 
 
 def open_file(path: Path):
-    #  跨平台打开文件
     try:
         if sys.platform.startswith("win"):
-            os.startfile(str(path.resolve()))
+            os.startfile(path)
         elif sys.platform == "darwin":
-            subprocess.run(["open", str(path.resolve())], check=True)
+            subprocess.run(["open", str(path)], check=True)
         else:
-            subprocess.run(["xdg-open", str(path.resolve())], check=True)
+            subprocess.run(["xdg-open", str(path)], check=True)
     except Exception as exc:
         logging.warning("打开 %s 失败：%s", path, exc)
-
-def extract_7z_safe(tail_file, extract_dir):
-    if not PATH_7ZIP.exists():
-        return []
-
-    extract_dir.mkdir(parents=True, exist_ok=True)
-
-    result = subprocess.run(
-        [str(PATH_7ZIP), "x", str(tail_file), f"-o{extract_dir}", "-y", "-bb1"],
-        capture_output=True,
-        text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-
-    # 如果解压失败（包含密码或其他原因），直接返回空
-    if result.returncode != 0:
-        show_message(f"解压失败，请手动处理: {tail_file.name}", "提示")
-        logging.error("解压失败: %s，stdout: %s, stderr: %s", tail_file.name, result.stdout, result.stderr)
-        return []
-
-    # 获取解压后的文件列表
-    extracted_files = []
-    for root, _, filenames in os.walk(extract_dir):
-        for fname in filenames:
-            fpath = Path(root) / fname
-            extracted_files.append(fpath)
-
-    logging.info(
-        "解压成功: %s -> %s，共 %d 个文件",
-        tail_file.name,
-        extract_dir,
-        len(extracted_files),
-    )
-
-    logging.info("解压文件列表: %s", extracted_files)
-
-    return extracted_files
-
-def extract_file(dir_name, base_name, tail_file, magic_headers, times=0):
-    global TARGET_DIR
-    if times > TIMES:
-        logging.error("递归次数过多，跳过解压：%s", tail_file)
-        show_message("递归次数过多，已停止解压该文件。", "错误")
-        return
-
-    extract_dir = dir_name / f"{base_name}-提取"
-    files = extract_7z_safe(tail_file, extract_dir)
-
-    # 无论多少文件，只要解压了，就记录 TARGET_DIR
-    if files:
-        TARGET_DIR = str(extract_dir)
-
-    if len(files) == 1:
-        file = files[0]
-        if file.suffix.lstrip('.').lower() not in set(magic_headers.values()):
-            logging.info("单文件解压完成，继续处理：%s", file)
-            return file
-        else:
-            logging.info("单文件解压完成，继续递归解压：%s", file)
-            return extract_file(dir_name=file.parent, base_name=file.stem,
-                                tail_file=file, magic_headers=magic_headers, times=times+1)
-    elif len(files) > 1:
-        logging.info("多个文件解压完成，认为处理成功：%s", extract_dir)
-        return
 
 # --------------------------------------------------------------------------- #
 #                                 弹窗线程                                   #
 # --------------------------------------------------------------------------- #
 
 class ProcessingPopup(threading.Thread):
-    # Tk 弹窗线程，用于显示处理进度
-
     def __init__(self, message: str = "正在处理..."):
-        super().__init__()
+        super().__init__(daemon=True)
         self.message = message
-        self._queue = queue.Queue()
-        self._stop_event = threading.Event()
+        self._queue: queue.Queue = queue.Queue()
+        self._ready = threading.Event()
 
     def run(self):
         self.root = Tk()
         self.root.title("处理进度")
-        w, h = 300, 100
-        x = (self.root.winfo_screenwidth() - w) // 2
+        w, h = 360, 100
+        x = (self.root.winfo_screenwidth()  - w) // 2
         y = (self.root.winfo_screenheight() - h) // 2
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.resizable(False, False)
-
-        self.label = Label(self.root, text=self.message, font=("Arial", 12))
+        self.label = Label(self.root, text=self.message, font=("Arial", 11))
         self.label.pack(pady=30)
-
-        self.root.after(100, self.check_queue)
+        self._ready.set()
+        self.root.after(100, self._check_queue)
         self.root.mainloop()
 
-    def check_queue(self):
+    def _check_queue(self):
         while not self._queue.empty():
-            msg = self._queue.get()
+            msg = self._queue.get_nowait()
             if msg == "__close__":
                 self.root.destroy()
                 return
             self.label.config(text=msg)
-        if not self._stop_event.is_set():
-            self.root.after(100, self.check_queue)
+        self.root.after(100, self._check_queue)
+
+    def wait_ready(self):
+        self._ready.wait()
 
     def update_message(self, msg: str):
         self._queue.put(msg)
 
     def close(self):
-        self._stop_event.set()
         self._queue.put("__close__")
 
 # --------------------------------------------------------------------------- #
-#                                 主逻辑                                       #
+#                                 文件处理                                   #
 # --------------------------------------------------------------------------- #
 
-def process_file(file_path: Path, popup: Optional[ProcessingPopup] = None, times: int = 0):
-    if times > TIMES:
-        logging.error("递归次数过多，跳过处理：%s", file_path)
-        show_message("递归次数过多，已停止处理该文件。", "错误")
-        return "递归次数过多" # 防止无限递归
-
-    # 处理单个文件，只提取压缩包部分
+def process_file(file_path: Path, magic_headers: Dict[bytes, str],
+                 popup: Optional[ProcessingPopup] = None):
     if popup:
         popup.update_message(f"提取: {file_path.name}")
 
-    try:
-        data = file_path.read_bytes()
-    except Exception as exc:
-        logging.error("无法读取 %s：%s", file_path, exc)
-        return "读取失败"
-
-    magic_headers = load_magic_headers()
-    if not magic_headers:
-        return "配置加载失败" # 配置加载失败
-
-    idx, fmt = find_compressed_start(data, magic_headers)
-
-    # 如果未找到压缩头或偏移为0，则跳过
+    idx, fmt = find_compressed_start(file_path, magic_headers)
     if idx == -1:
         logging.info("未找到压缩包标识：%s", file_path)
-        return "未找到压缩包标识"
-    if idx == 0:
-        logging.info("跳过偏移为0的文件：%s (格式: %s)", file_path.name, fmt)
-        return "偏移为0"
+        return
 
-    base_name = file_path.stem
-    dir_name = file_path.parent
-
-    # 提取压缩包部分
-    tail_data = data[idx:]
-    tail_file = dir_name / safe_filename(base_name, f"提取.{fmt}")
-
-    try:
-        tail_file.write_bytes(tail_data)
-        logging.info(
-            "[%s] 提取成功: %s (偏移: %d 字节, 大小: %d 字节)",
-            file_path.name,
-            fmt,
-            idx,
-            len(tail_data),
-        )
-
-        # 打开提取的压缩包
-        # open_file(tail_file)
-
-        # 递归处理提取的文件
-        file= extract_file(dir_name=dir_name, base_name=base_name, tail_file=tail_file, magic_headers=magic_headers)
-        if file:
-            process_file(file, popup, times + 1)
-
-        
-
-        return "DONE"
-        # else:
-        #     logging.error("未知返回类型：%s", type(file))
-        #     return "未知返回类型"
-
-
-    except Exception as exc:
-        logging.error("保存/打开失败：%s", exc)
-
-def process_path(target_path: Path):
-    global ROOT_DIR
-    # 仅处理单个文件
-    popup = ProcessingPopup("提取压缩包中...")
-    popup.start()
-
-    try:
-        if not target_path.is_file():
-            show_message("请选择单个文件运行本程序", "提示")
-            logging.warning("跳过无效输入：%s (不是文件)", target_path)
-            return
-
-        popup.update_message(f"提取: {target_path.name}")
-        ROOT_DIR = target_path.parent
-        state = process_file(target_path, popup)
-
-        # 将TARGET_DIR移动到右键选择的文件的同级目录的"提取结果"文件夹中
-        if TARGET_DIR:
-            final_dir = ROOT_DIR / "提取结果"
-            final_dir.mkdir(exist_ok=True)
-
-            # 只移动 TARGET_DIR 内的内容
-            for item in Path(TARGET_DIR).iterdir():
-                dest = final_dir / item.name
-                if dest.exists():
-                    if dest.is_dir():
-                        shutil.rmtree(dest)
-                    else:
-                        dest.unlink()
-                logging.info("将 %s 移动到 %s", item, dest)
-                shutil.move(str(item), str(dest))
-
-            logging.info("已将提取结果移动到：%s", final_dir)
-
-        if state == "DONE":
-            popup.update_message("处理完成！")
-            logging.info("处理完成：%s", target_path.name)
-        else:
-            popup.update_message("预期外的返回%s" % state)
-            logging.warning("预期外的返回%s" % state)
-
-    finally:
-        if hasattr(popup, "root"):
-            popup.root.after(1500, popup.close)
+    extract_tail(file_path, idx, fmt)
 
 # --------------------------------------------------------------------------- #
 #                                 程序入口                                   #
 # --------------------------------------------------------------------------- #
 
-
 def main():
     if len(sys.argv) != 2:
-        show_message("请通过右键文件或文件夹执行本程序", "提示")
+        show_message("请通过右键文件执行本程序", "提示")
         sys.exit(1)
 
     target = Path(sys.argv[1])
-    process_path(target)
+    if not target.is_file():
+        show_message("请选择有效文件", "提示")
+        sys.exit(1)
+
+    magic_headers = load_magic_headers()
+    if not magic_headers:
+        sys.exit(1)
+
+    popup = ProcessingPopup(f"提取: {target.name}")
+    popup.start()
+    popup.wait_ready()
+
+    try:
+        process_file(target, magic_headers, popup)
+        popup.update_message("完成！")
+        time.sleep(1.2)
+    except Exception as exc:
+        logging.error("处理出错：%s", exc)
+        popup.update_message(f"出错：{exc}")
+        time.sleep(2.0)
+    finally:
+        popup.close()
 
 
 if __name__ == "__main__":

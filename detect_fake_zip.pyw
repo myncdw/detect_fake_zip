@@ -27,9 +27,7 @@ else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 
 MAGIC_HEADERS_JSON = SCRIPT_DIR / "magic_headers.json"
-LOG_FILE           = SCRIPT_DIR / "analysis.log"
-
-
+LOG_FILE = SCRIPT_DIR / "analysis.log"
 
 
 # --------------------------------------------------------------------------- #
@@ -178,10 +176,10 @@ def process_file(file_path: Path, magic_headers: Dict[bytes, str],
         popup.update_message(f"提取: {file_path.name}")
 
     idx, fmt = find_compressed_start(file_path, magic_headers)
-    if idx == -1:
+    if idx == -1 or fmt is None:
         logging.info("未找到压缩包标识：%s", file_path)
         return
-
+    
     extract_tail(file_path, idx, fmt)
 
 # --------------------------------------------------------------------------- #

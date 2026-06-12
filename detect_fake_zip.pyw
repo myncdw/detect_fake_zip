@@ -8,6 +8,7 @@ import ctypes
 import logging
 import mmap
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -27,7 +28,9 @@ else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 
 MAGIC_HEADERS_JSON = SCRIPT_DIR / "magic_headers.json"
-LOG_FILE = SCRIPT_DIR / "analysis.log"
+LOG_FILE           = SCRIPT_DIR / "analysis.log"
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -72,23 +75,40 @@ def load_magic_headers() -> Dict[bytes, str]:
         return {}
 
 
+TAR_USTAR = b"ustar"
+
+
 def find_compressed_start(
     file_path: Path, magic_headers: Dict[bytes, str]
 ) -> Tuple[int, Optional[str]]:
+    # 把所有候选 magic（含 tar 的 ustar 标识）合并成一个正则，
+    # 一次遍历即可找到文件中最早出现的那个匹配。
+    # 多个 magic 在同一位置都能匹配时，regex 取的是声明顺序里
+    # 第一个，但这里只关心“最早的偏移”，顺序不影响结果。
+    non_tar = {magic: fmt for magic, fmt in magic_headers.items() if fmt != "tar"}
+    all_magics = list(non_tar.keys()) + [TAR_USTAR]
+    regex = re.compile(b"|".join(re.escape(m) for m in all_magics))
+
     with file_path.open("rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            ustar_idx = mm.find(b"ustar")
-            if ustar_idx != -1 and ustar_idx >= 257:
-                return ustar_idx - 257, "tar"
+            pos = 0
+            while True:
+                m = regex.search(mm, pos)
+                if not m:
+                    return -1, None
 
-            for magic, fmt in sorted(magic_headers.items(), key=lambda x: -len(x[0])):
-                if fmt == "tar":
+                matched, idx = m.group(), m.start()
+
+                if matched == TAR_USTAR:
+                    if idx >= 257:
+                        return idx - 257, "tar"
+                    # 偏移小于 257，回退不到合法的 tar 块头，
+                    # 这是误判（或文件开头本身就含 "ustar" 字样），
+                    # 跳过这个位置继续向后找。
+                    pos = idx + 1
                     continue
-                idx = mm.find(magic)
-                if idx != -1:
-                    return idx, fmt
 
-    return -1, None
+                return idx, non_tar[matched]
 
 
 def extract_tail(file_path: Path, start_offset: int, fmt: str):
@@ -179,7 +199,7 @@ def process_file(file_path: Path, magic_headers: Dict[bytes, str],
     if idx == -1 or fmt is None:
         logging.info("未找到压缩包标识：%s", file_path)
         return
-    
+
     extract_tail(file_path, idx, fmt)
 
 # --------------------------------------------------------------------------- #
@@ -217,4 +237,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # 记录运行时间
+    start_time = time.time()
     main()
+    end_time = time.time()
+    logging.debug("总耗时: %.2f 秒", end_time - start_time)
